@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bulk-campaign/internal/notifier"
 	"bulk-campaign/internal/pipeline"
 	"bulk-campaign/internal/worker"
 	"context"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 )
@@ -18,20 +20,41 @@ const (
 	addr        = ":8080"
 )
 
+type server struct {
+	dispatcher *notifier.Dispatcher
+}
+
 func main() {
 	// Root context — cancelled on SIGINT/SIGTERM
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	smtpPort, _ := strconv.Atoi(getEnv("SMTP_PORT", "587"))
+
+	emailNotifier := notifier.NewEmailNotifier(notifier.EmailConfig{
+		Host:     getEnv("SMTP_HOST", "localhost"),
+		Port:     smtpPort,
+		Username: getEnv("SMTP_USER", ""),
+		Password: getEnv("SMTP_PASS", ""),
+		From:     getEnv("SMTP_FROM", "no-reply@example.com"),
+	})
+
+	registry := map[notifier.Channel]notifier.Notifier{
+		notifier.ChannelEmail: emailNotifier,
+	}
+
+	s := &server{
+		dispatcher: notifier.NewDispatcher(registry),
+	}
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /upload", uploadHandler)
+	mux.HandleFunc("POST /upload", s.uploadHandler)
 
 	srv := &http.Server{
 		Addr:    addr,
 		Handler: mux,
 	}
 
-	// Start HTTP server in background
 	go func() {
 		log.Printf("listening on %s", addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -39,11 +62,9 @@ func main() {
 		}
 	}()
 
-	// Block until signal
 	<-ctx.Done()
 	log.Println("shutdown signal received")
 
-	// Give in-flight requests 30 s to finish
 	shutCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -55,8 +76,7 @@ func main() {
 	os.Exit(0)
 }
 
-func uploadHandler(w http.ResponseWriter, r *http.Request) {
-	// 32 MB max memory for multipart
+func (s *server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
@@ -69,13 +89,11 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	ctx := r.Context() // cancelled if client disconnects or server shuts down
-
+	ctx := r.Context()
 	records, errc := pipeline.Reader(ctx, file)
 
-	process := func(_ context.Context, rec pipeline.Record) error {
-		log.Printf("processing: name=%s email=%s", rec.Name, rec.Email)
-		return nil
+	process := func(ctx context.Context, rec pipeline.Record) error {
+		return s.dispatcher.Send(ctx, rec)
 	}
 
 	var total, failed int
@@ -92,4 +110,11 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	fmt.Fprintf(w, "done — processed %d records, %d failed\n", total, failed)
+}
+
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
