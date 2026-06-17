@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bulk-campaign/internal/metrics"
 	"bulk-campaign/internal/notifier"
 	"bulk-campaign/internal/pipeline"
 	"bulk-campaign/internal/worker"
@@ -13,6 +14,8 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const (
@@ -25,7 +28,6 @@ type server struct {
 }
 
 func main() {
-	// Root context — cancelled on SIGINT/SIGTERM
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -49,6 +51,8 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /upload", s.uploadHandler)
+	mux.HandleFunc("GET /healthz", healthzHandler)
+	mux.Handle("GET /metrics", promhttp.Handler())
 
 	srv := &http.Server{
 		Addr:    addr,
@@ -77,6 +81,11 @@ func main() {
 }
 
 func (s *server) uploadHandler(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	defer func() {
+		metrics.UploadDuration.Observe(time.Since(start).Seconds())
+	}()
+
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
@@ -101,7 +110,10 @@ func (s *server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 		total++
 		if result.Err != nil {
 			failed++
+			metrics.RecordsProcessed.WithLabelValues("failed").Inc()
 			log.Printf("record error: %v", result.Err)
+		} else {
+			metrics.RecordsProcessed.WithLabelValues("success").Inc()
 		}
 	}
 
@@ -110,6 +122,11 @@ func (s *server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	fmt.Fprintf(w, "done — processed %d records, %d failed\n", total, failed)
+}
+
+func healthzHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintln(w, "ok")
 }
 
 func getEnv(key, fallback string) string {
