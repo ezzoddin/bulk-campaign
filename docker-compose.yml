@@ -1,0 +1,58 @@
+version: '3.9'
+
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      SMTP_HOST: mailhog
+      SMTP_PORT: 1025
+      SMTP_FROM: bulk-campaign@example.com
+      DLQ_PATH: /data/dlq.jsonl
+      LOG_LEVEL: debug
+      JAEGER_ENDPOINT: http://jaeger:14268/api/traces
+    volumes:
+      - ./data:/data
+    depends_on:
+      - postgres
+      - redis
+      - jaeger
+      - mailhog
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: campaign
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: bulk_campaign
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.52
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "14268:14268"  # Jaeger collector HTTP
+      - "6831:6831/udp"  # Jaeger agent (optional)
+    environment:
+      COLLECTOR_ZIPKIN_HOST_PORT: ":9411"
+
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    ports:
+      - "1025:1025"  # SMTP
+      - "8026:8025"  # Web UI
+
+volumes:
+  postgres_data:
+  redis_data:

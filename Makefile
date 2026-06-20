@@ -1,22 +1,22 @@
 .PHONY: build test lint clean run
 
-BINARY=bin/server
-GO=go
+BINARY_NAME=server
+BUILD_DIR=bin
 
 build:
-	$(GO) build -o $(BINARY) ./cmd/server
-
-run:
-	$(GO) run ./cmd/server
+	@echo "Building $(BINARY_NAME)..."
+	@if not exist $(BUILD_DIR) mkdir $(BUILD_DIR)
+	go build -o $(BUILD_DIR)/$(BINARY_NAME).exe ./cmd/server
 
 test:
-	$(GO) test -race -cover ./...
+	go test -v -race -coverprofile=coverage.out ./...
 
 lint:
 	golangci-lint run ./...
 
 clean:
-	rm -rf bin/
+	@if exist $(BUILD_DIR) rmdir /s /q $(BUILD_DIR)
+	@if exist coverage.out del coverage.out
 
-tidy:
-	$(GO) mod tidy
+run: build
+	.\$(BUILD_DIR)\$(BINARY_NAME).exe
