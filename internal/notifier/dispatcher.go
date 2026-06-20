@@ -2,22 +2,28 @@ package notifier
 
 import (
 	"bulk-campaign/internal/pipeline"
+	"bulk-campaign/internal/resilience"
 	"context"
 	"fmt"
 )
 
-// Dispatcher resolves the correct Notifier from a registry and delegates.
+// Dispatcher resolves the correct Notifier and delegates with retry + DLQ.
 type Dispatcher struct {
 	registry map[Channel]Notifier
+	retryCfg resilience.RetryConfig
+	dlq      *resilience.DLQ
 }
 
-// NewDispatcher builds a Dispatcher from an explicit map.
-func NewDispatcher(registry map[Channel]Notifier) *Dispatcher {
-	return &Dispatcher{registry: registry}
+// NewDispatcher builds a Dispatcher with retry and DLQ support.
+func NewDispatcher(registry map[Channel]Notifier, retryCfg resilience.RetryConfig, dlq *resilience.DLQ) *Dispatcher {
+	return &Dispatcher{
+		registry: registry,
+		retryCfg: retryCfg,
+		dlq:      dlq,
+	}
 }
 
-// Send looks up the channel stored in rec.Payload["channel"] and delegates.
-// Falls back to email if the key is absent.
+// Send looks up the channel, wraps in retry, and writes to DLQ on permanent failure.
 func (d *Dispatcher) Send(ctx context.Context, rec pipeline.Record) error {
 	ch := Channel(rec.Payload["channel"])
 	if ch == "" {
@@ -26,8 +32,19 @@ func (d *Dispatcher) Send(ctx context.Context, rec pipeline.Record) error {
 
 	n, ok := d.registry[ch]
 	if !ok {
-		return fmt.Errorf("notifier: unknown channel %q", ch)
+		err := fmt.Errorf("notifier: unknown channel %q", ch)
+		_ = d.dlq.Write(rec, err) // log config error to DLQ
+		return err
 	}
 
-	return n.Send(ctx, rec)
+	err := resilience.RetryFunc(ctx, d.retryCfg, func(ctx context.Context) error {
+		return n.Send(ctx, rec)
+	})
+
+	if err != nil {
+		_ = d.dlq.Write(rec, err)
+		return err
+	}
+
+	return nil
 }

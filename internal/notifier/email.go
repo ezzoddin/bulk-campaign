@@ -1,12 +1,25 @@
 package notifier
 
 import (
+	"bulk-campaign/internal/metrics"
 	"bulk-campaign/internal/pipeline"
 	"context"
 	"fmt"
+	"log/slog"
 
-	"gopkg.in/gomail.v2"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"gopkg.in/mail.v2"
 )
+
+var tracer = otel.Tracer("notifier")
+
+// EmailNotifier sends notifications via SMTP.
+type EmailNotifier struct {
+	cfg    EmailConfig
+	logger *slog.Logger
+}
 
 // EmailConfig holds SMTP connection parameters.
 type EmailConfig struct {
@@ -17,41 +30,48 @@ type EmailConfig struct {
 	From     string
 }
 
-// EmailNotifier sends transactional email via SMTP.
-type EmailNotifier struct {
-	cfg    EmailConfig
-	dialer *gomail.Dialer
-}
-
-// NewEmailNotifier constructs an EmailNotifier and opens a reusable dialer.
+// NewEmailNotifier creates an SMTP-based notifier.
 func NewEmailNotifier(cfg EmailConfig) *EmailNotifier {
-	d := gomail.NewDialer(cfg.Host, cfg.Port, cfg.Username, cfg.Password)
-	return &EmailNotifier{cfg: cfg, dialer: d}
+	return &EmailNotifier{
+		cfg:    cfg,
+		logger: slog.Default().With("notifier", "email"),
+	}
 }
 
-// Send composes and delivers a message to rec.Email.
+// Send delivers an email using SMTP.
 func (e *EmailNotifier) Send(ctx context.Context, rec pipeline.Record) error {
-	// Respect cancellation before doing network I/O
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
+	ctx, span := tracer.Start(ctx, "send_email")
+	defer span.End()
+
+	span.SetAttributes(
+		attribute.String("email", rec.Email),
+		attribute.String("smtp_host", e.cfg.Host),
+	)
 
 	if rec.Email == "" {
-		return fmt.Errorf("email notifier: empty recipient for record %q", rec.Name)
+		err := fmt.Errorf("email: missing recipient email")
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "missing email")
+		return err
 	}
 
-	//TODO: set dynamic subject and body filed
-	m := gomail.NewMessage()
+	m := mail.NewMessage()
 	m.SetHeader("From", e.cfg.From)
 	m.SetHeader("To", rec.Email)
-	m.SetHeader("Subject", "Your campaign message")
-	m.SetBody("text/plain", fmt.Sprintf("Hello %s,\n\nThis is your campaign message.", rec.Name))
+	m.SetHeader("Subject", fmt.Sprintf("Hello %s", rec.Name))
+	m.SetBody("text/plain", fmt.Sprintf("Hi %s, this is a bulk campaign message.", rec.Name))
 
-	if err := e.dialer.DialAndSend(m); err != nil {
-		return fmt.Errorf("email notifier: send to %s: %w", rec.Email, err)
+	d := mail.NewDialer(e.cfg.Host, e.cfg.Port, e.cfg.Username, e.cfg.Password)
+
+	if err := d.DialAndSend(m); err != nil {
+		e.logger.ErrorContext(ctx, "failed to send email", "email", rec.Email, "error", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return fmt.Errorf("email: %w", err)
 	}
 
+	metrics.NotificationsSent.WithLabelValues("email").Inc()
+	span.SetStatus(codes.Ok, "")
+	e.logger.DebugContext(ctx, "email sent", "email", rec.Email)
 	return nil
 }
